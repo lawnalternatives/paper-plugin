@@ -1,0 +1,4 @@
+name: lawnalternatives
+version: '${version}'
+main: org.lawnalternatives.lawnalternatives.LawnAlternatives
+api-version: '1.20'

@@ -1,8 +1,13 @@
 package org.lawnalternatives.lawnalternatives;
 
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.TextComponent;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.apache.commons.lang3.text.WordUtils;
 import org.bukkit.*;
 import org.bukkit.block.Block;
+import org.bukkit.block.data.BlockData;
+import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
@@ -11,14 +16,17 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
+import org.bukkit.event.entity.VillagerCareerChangeEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.inventory.*;
+import org.bukkit.inventory.meta.EnchantmentStorageMeta;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.text.MessageFormat;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 public final class LawnAlternatives extends JavaPlugin implements Listener {
@@ -36,10 +44,12 @@ public final class LawnAlternatives extends JavaPlugin implements Listener {
     static final int TOWN_DIM_Z = 250;
 
     Server server;
+    BlockData airData;
 
     @Override
     public void onEnable() {
         server = getServer();
+        airData = server.createBlockData(Material.AIR);
         server.getPluginManager().registerEvents(this, this);
         addReverseRecipes();
     }
@@ -47,6 +57,147 @@ public final class LawnAlternatives extends JavaPlugin implements Listener {
     @Override
     public void onDisable() {
         HandlerList.unregisterAll((Listener) this);
+    }
+
+    public List<MerchantRecipe> getTownRecipes(Location location) {
+        return location.getWorld().getNearbyEntities(location, TOWN_DIM_X, TOWN_DIM_Y, TOWN_DIM_Z).stream()
+                .filter(e -> e.getType() == EntityType.VILLAGER)
+                .flatMap(e -> ((Villager) e).getRecipes().stream()
+                        .map(r -> {
+                            MerchantRecipe mr = new MerchantRecipe(r.getResult(), /* uses= */0,
+                                    /* maxUses= */Integer.MAX_VALUE, /* experienceReward= */false);
+                            r.getIngredients().forEach(mr::addIngredient);
+                            return mr;
+                        }))
+                .toList();
+    }
+
+    @EventHandler
+    public void onPlayerInteract(PlayerInteractEvent event) {
+        if (event.getAction() != Action.RIGHT_CLICK_BLOCK)
+            return;
+        Player player = event.getPlayer();
+        Block block = event.getClickedBlock();
+        if (!player.isSneaking() || block == null)
+            return;
+        boolean shouldCancel = true;
+        switch (block.getType()) {
+            default: {
+                shouldCancel = false;
+                break;
+            }
+            case BELL: {
+                Bukkit.getScheduler().runTask(this,
+                        () -> {
+                            Merchant merchant = Bukkit.createMerchant(Component.text("Trading Post"));
+                            merchant.setRecipes(getTownRecipes(block.getLocation()));
+                            player.openMerchant(merchant, true);
+                        });
+                break;
+            }
+            case BARREL:
+            case BLAST_FURNACE:
+            case BREWING_STAND:
+            case CARTOGRAPHY_TABLE:
+            case CAULDRON:
+            case COMPOSTER:
+            case FLETCHING_TABLE:
+            case GRINDSTONE:
+            case LECTERN:
+            case LOOM:
+            case SMITHING_TABLE:
+            case SMOKER:
+            case STONECUTTER: {
+                BlockData origBlockData = block.getBlockData();
+                Bukkit.getScheduler().runTask(this,
+                        () -> {
+                            block.setBlockData(airData);
+                            Bukkit.getScheduler().runTaskLater(this,
+                                    () -> {
+                                        // TODO: turn to item if block is no longer air?
+                                        block.setBlockData(origBlockData);
+                                    }, 2L);
+                        });
+                break;
+            }
+        }
+        event.setCancelled(shouldCancel);
+    }
+
+    @EventHandler
+    public void onPlayerInteractEntity(PlayerInteractEntityEvent event) {
+        Player player = event.getPlayer();
+        PlayerInventory inventory = player.getInventory();
+        Entity entity = event.getRightClicked();
+        if (!player.isSneaking() || entity.getType() != EntityType.VILLAGER)
+            return;
+        Villager villager = (Villager) entity;
+        int level = villager.getVillagerLevel();
+        if (level == 1) {
+            player.sendMessage(Component.text(ERROR_LEVEL_ONE));
+            event.setCancelled(true);
+            return;
+        }
+        if (inventory.getItemInMainHand().getType() != TRADE_REFRESH_MATERIAL) {
+            player.sendMessage(Component.text(MessageFormat.format(ERROR_MUST_HOLD, TRADE_REFRESH_MATERIAL.name())));
+            event.setCancelled(true);
+            return;
+        }
+        int tradeRefreshAmount = TRADE_REFRESH_AMOUNT_PER_LEVEL * (level - 1);
+        if (!inventory.contains(TRADE_REFRESH_MATERIAL, tradeRefreshAmount)) {
+            player.sendMessage(Component.text(
+                    MessageFormat.format(ERROR_NOT_ENOUGH, tradeRefreshAmount, TRADE_REFRESH_MATERIAL.name())));
+            event.setCancelled(true);
+            return;
+        }
+        player.sendMessage(Component
+                .text(MessageFormat.format(SUCCESS_YOU_SPENT, tradeRefreshAmount, TRADE_REFRESH_MATERIAL.name())));
+        inventory.removeItemAnySlot(new ItemStack(TRADE_REFRESH_MATERIAL, tradeRefreshAmount));
+        villager.setVillagerLevel(1);
+        ArrayList<MerchantRecipe> levelOneRecipes = new ArrayList<>();
+        levelOneRecipes.add(villager.getRecipe(0));
+        levelOneRecipes.add(villager.getRecipe(1));
+        villager.setRecipes(levelOneRecipes);
+        villager.increaseLevel(level - 1);
+    }
+
+    private static String cleanKey(NamespacedKey key) {
+        return WordUtils.capitalizeFully(key.getKey().replace('_', ' '));
+    }
+
+    private static String formatEnchantments(Map<Enchantment, Integer> enchantments) {
+        return enchantments.entrySet().stream().map((e) ->
+                "[%s:%d]".formatted(cleanKey(e.getKey().getKey()), e.getValue())).collect(Collectors.joining());
+    }
+
+    @EventHandler
+    public void onVillagerCareerChangeEvent(VillagerCareerChangeEvent event) {
+        if (event.getReason() != VillagerCareerChangeEvent.ChangeReason.EMPLOYED)
+            return;
+        Villager villager = event.getEntity();
+        Bukkit.getScheduler().runTask(this, () -> {
+            if (!villager.isValid())
+                return;
+            String profession = cleanKey(villager.getProfession().getKey());
+            List<String> newRecipes = villager.getRecipes().stream().map(Recipe::getResult).map((ItemStack stack) ->
+                    {
+                        String itemName = cleanKey(stack.getType().getKey());
+                        String enchantments = formatEnchantments(stack.getEnchantments());
+                        if (stack.getItemMeta() instanceof EnchantmentStorageMeta enchantmentStorageMeta)
+                            enchantments += formatEnchantments(enchantmentStorageMeta.getStoredEnchants());
+                        return "%s%s".formatted(itemName, enchantments);
+                    }
+            ).toList();
+            TextComponent.Builder component = Component.text()
+                    .append(Component.text(profession, NamedTextColor.GREEN))
+                    .append(Component.text(" now sells: ", NamedTextColor.WHITE));
+            for (String newRecipe : newRecipes) {
+                component.append(Component.text(newRecipe, NamedTextColor.GREEN))
+                        .append(Component.text("; ", NamedTextColor.WHITE));
+            }
+            for (Player nearbyPlayer : villager.getLocation().getNearbyPlayers(TOWN_DIM_X, TOWN_DIM_Y, TOWN_DIM_Z))
+                nearbyPlayer.sendMessage(component);
+        });
     }
 
     public void addReverseSlabRecipe(Material fullMat, Material slabMat) {
@@ -233,72 +384,5 @@ public final class LawnAlternatives extends JavaPlugin implements Listener {
         addReverseSlabRecipes();
         addReverseStairsRecipes();
         addReverseWallRecipes();
-    }
-
-    public List<MerchantRecipe> getTownRecipes(Location location) {
-        return location.getWorld().getNearbyEntities(location, TOWN_DIM_X, TOWN_DIM_Y, TOWN_DIM_Z).stream()
-                .filter(e -> e.getType() == EntityType.VILLAGER)
-                .flatMap(e -> ((Villager) e).getRecipes().stream()
-                        .map(r -> {
-                            MerchantRecipe mr = new MerchantRecipe(r.getResult(), /* uses= */0,
-                                    /* maxUses= */Integer.MAX_VALUE, /* experienceReward= */false);
-                            r.getIngredients().forEach(mr::addIngredient);
-                            return mr;
-                        }))
-                .collect(Collectors.toList());
-    }
-
-    @EventHandler
-    public void onPlayerInteract(PlayerInteractEvent event) {
-        if (event.getAction() != Action.RIGHT_CLICK_BLOCK)
-            return;
-        Player player = event.getPlayer();
-        Block block = event.getClickedBlock();
-        if (!player.isSneaking() || block == null || block.getType() != Material.BELL)
-            return;
-        event.setCancelled(true);
-        Bukkit.getScheduler().runTask(this,
-                () -> {
-                    Merchant merchant = Bukkit.createMerchant(Component.text("Trading Post"));
-                    merchant.setRecipes(getTownRecipes(block.getLocation()));
-                    player.openMerchant(merchant, true);
-                });
-    }
-
-    @EventHandler
-    public void onPlayerInteractEntity(PlayerInteractEntityEvent event) {
-        Player player = event.getPlayer();
-        PlayerInventory inventory = player.getInventory();
-        Entity entity = event.getRightClicked();
-        if (!player.isSneaking() || entity.getType() != EntityType.VILLAGER)
-            return;
-        Villager villager = (Villager) entity;
-        int level = villager.getVillagerLevel();
-        if (level == 1) {
-            player.sendMessage(Component.text(ERROR_LEVEL_ONE));
-            event.setCancelled(true);
-            return;
-        }
-        if (inventory.getItemInMainHand().getType() != TRADE_REFRESH_MATERIAL) {
-            player.sendMessage(Component.text(MessageFormat.format(ERROR_MUST_HOLD, TRADE_REFRESH_MATERIAL.name())));
-            event.setCancelled(true);
-            return;
-        }
-        int tradeRefreshAmount = TRADE_REFRESH_AMOUNT_PER_LEVEL * (level - 1);
-        if (!inventory.contains(TRADE_REFRESH_MATERIAL, tradeRefreshAmount)) {
-            player.sendMessage(Component.text(
-                    MessageFormat.format(ERROR_NOT_ENOUGH, tradeRefreshAmount, TRADE_REFRESH_MATERIAL.name())));
-            event.setCancelled(true);
-            return;
-        }
-        player.sendMessage(Component
-                .text(MessageFormat.format(SUCCESS_YOU_SPENT, tradeRefreshAmount, TRADE_REFRESH_MATERIAL.name())));
-        inventory.removeItemAnySlot(new ItemStack(TRADE_REFRESH_MATERIAL, tradeRefreshAmount));
-        villager.setVillagerLevel(1);
-        ArrayList<MerchantRecipe> levelOneRecipes = new ArrayList<>();
-        levelOneRecipes.add(villager.getRecipe(0));
-        levelOneRecipes.add(villager.getRecipe(1));
-        villager.setRecipes(levelOneRecipes);
-        villager.increaseLevel(level - 1);
     }
 }
